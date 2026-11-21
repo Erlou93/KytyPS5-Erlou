@@ -54,6 +54,12 @@ constexpr SwitchInfo Switches[] = {
     // Measurement only (APPROXIMATION, 11.11 ceiling of the per-draw checks): whether the check of a helper's logged
     // reads at adoption (kernel/memory.cpp FastVerifyLoggedReads) is skipped - the helper's result is taken as unchanged.
     {Switch::DiagAdoptAssume, "KYTY_DIAG_ADOPT_ASSUME_UNCHANGED", 1},
+    // Only how the check of a helper's logged reads compares them (kernel/memory.cpp
+    // FastVerifyLoggedReads): the spans the helper merged (on) or the entries, one run at a time
+    // (off). The same bytes are compared with the same memory and anything but "all equal" takes
+    // the entry path; the plan is built for every log while the switch is listed and is valid
+    // whether it is used or not. Read once per check.
+    {Switch::AdoptPlan, "KYTY_PERF_ADOPT_PLAN", 1},
     // Project 15 way B P1 (test switch): a read-only buffer binding with a ready plan entry whose proof holds takes the
     // binding the helper computed (handle, aligned offset, range, offset byte, record stride) instead of RebindBuffers'.
 };

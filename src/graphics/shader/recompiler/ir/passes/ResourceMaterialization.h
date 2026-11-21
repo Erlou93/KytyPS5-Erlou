@@ -140,6 +140,29 @@ struct ReadLog {
 	// Starts a new log (the reads the stages of one operation repeat are logged once, while they read the same bytes).
 	void Clear();
 
+	// KYTY_PERF_ADOPT_PLAN: the same reads as spans sorted by kind and address, overlapping and
+	// adjacent ones merged, each with its bytes in one piece (plan_bytes). The thread that made the
+	// log builds it once the operation's reads are complete (BuildPlan); the check
+	// (kernel/memory.cpp FastVerifyLoggedReads) then compares a span at a time instead of a run of
+	// entries at a time. The spans hold exactly the logged bytes, each once. A plan belongs to the
+	// log it was built from: plan_entries and plan_byte_count are the log's sizes then (entries are
+	// only appended, never changed). No plan when an entry is not a plain successful read, or two
+	// reads of the same bytes disagree: the entry path decides those logs.
+	struct PlanSpan {
+		uint64_t address = 0;
+		uint32_t size    = 0;
+		uint32_t first   = 0; // offset in plan_bytes
+		Kind     kind    = Kind::Ordinary;
+	};
+	std::vector<PlanSpan> plan;
+	std::vector<uint8_t>  plan_bytes;
+	size_t                plan_entries    = 0;
+	size_t                plan_byte_count = 0;
+	bool                  plan_valid      = false;
+	void                  BuildPlan();
+	[[nodiscard]] bool    PlanUsable() const noexcept {
+        return plan_valid && plan_entries == entries.size() && plan_byte_count == bytes.size();
+	}
 };
 
 // Reads guest memory for the ahead path: the bytes of [vaddr, vaddr + size) as the backing store holds them,

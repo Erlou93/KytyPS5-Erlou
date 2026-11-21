@@ -2904,7 +2904,68 @@ bool MaterializeResourcesAhead(const ResourcePlan& program, const SrtRuntime& ru
 void ReadLog::Clear() {
 	entries.clear();
 	bytes.clear();
+	plan.clear();
+	plan_bytes.clear();
+	plan_valid = false;
 	t_ahead_epoch++;
+}
+
+void ReadLog::BuildPlan() {
+	plan.clear();
+	plan_bytes.clear();
+	plan_valid = false;
+	if (entries.empty()) return;
+	const size_t byte_count = bytes.size();
+	for (const auto& e: entries) {
+		// What the verifier takes without the readers: a successful read with its bytes in the log,
+		// a strict one of whole DWORDs, none larger than the readers' buffer.
+		if (!e.ok || e.size == 0 || e.size > MaxCallBytes ||
+		    (e.kind == Kind::Strict && e.size % sizeof(uint32_t) != 0u) || e.first > byte_count ||
+		    e.size > byte_count - e.first) {
+			return;
+		}
+	}
+	thread_local std::vector<uint32_t> order;
+	order.resize(entries.size());
+	for (uint32_t i = 0; i < order.size(); i++)
+		order[i] = i;
+	std::sort(order.begin(), order.end(), [&](uint32_t l, uint32_t r) {
+		const auto& a = entries[l];
+		const auto& b = entries[r];
+		if (a.kind != b.kind) return a.kind < b.kind;
+		if (a.address != b.address) return a.address < b.address;
+		return a.size > b.size;
+	});
+	plan_bytes.reserve(byte_count);
+	for (const uint32_t index: order) {
+		const auto&    e      = entries[index];
+		const uint8_t* source = bytes.data() + e.first;
+		if (!plan.empty() && plan.back().kind == e.kind &&
+		    e.address <= plan.back().address + plan.back().size) {
+			auto&          span    = plan.back();
+			const uint64_t end     = span.address + span.size;
+			const uint64_t overlap = std::min<uint64_t>(end, e.address + e.size) - e.address;
+			// Bytes two reads hold must agree; a log that disagrees with itself is left to the
+			// entry path.
+			if (overlap != 0 &&
+			    std::memcmp(plan_bytes.data() + span.first + (e.address - span.address), source,
+			                static_cast<size_t>(overlap)) != 0) {
+				plan.clear();
+				plan_bytes.clear();
+				return;
+			}
+			if (e.size > overlap) {
+				plan_bytes.insert(plan_bytes.end(), source + overlap, source + e.size);
+				span.size += static_cast<uint32_t>(e.size - overlap);
+			}
+		} else {
+			plan.push_back({e.address, e.size, static_cast<uint32_t>(plan_bytes.size()), e.kind});
+			plan_bytes.insert(plan_bytes.end(), source, source + e.size);
+		}
+	}
+	plan_entries    = entries.size();
+	plan_byte_count = byte_count;
+	plan_valid      = true;
 }
 
 bool ReadGuestAhead(ReadLog& log, uint64_t address, void* data, uint64_t size) {
