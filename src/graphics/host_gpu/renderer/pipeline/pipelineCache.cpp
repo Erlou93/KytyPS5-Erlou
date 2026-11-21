@@ -11,6 +11,7 @@
 #include "common/emulatorConfig.h"
 #include "common/envRead.h"
 #include "common/file.h"
+#include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/lookupMemo.h"
 #include "common/onceValue.h"
@@ -256,6 +257,19 @@ void ResolvedStagesFault(ResolvedStages& stages, uint32_t fault) {
 }
 
 namespace {
+// KYTY_PERF_ADOPT_PLAN (kernel/memory.cpp FastVerifyLoggedReads; 0 off, 1 on, 2 verify): the
+// resolve helpers build a log's read plan (ReadLog::BuildPlan) only when the switch can be on in
+// this run - set, or listed in KYTY_LIVE_AB.
+bool AdoptPlanPossible() {
+	static const bool possible = [] {
+		const char* value = std::getenv("KYTY_PERF_ADOPT_PLAN");
+		const bool  set =
+		    value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0';
+		return Common::LiveAb::Possible(Common::LiveAb::Switch::AdoptPlan, set ? 1u : 0u);
+	}();
+	return possible;
+}
+
 // Every read the resolve thread made for the operation reads the same through this thread's readers now (which download
 // GPU-dirty bytes and wait for pending readbacks, as the operation's own walk would): operations before this one and the
 // guest's own threads write guest memory after those reads. Asked once per operation, each read once.
@@ -2309,6 +2323,8 @@ void PipelineCache::ResolveDispatchPrograms(RenderContext& renderer, const HW::C
 	results.adoptable          = !indirect;
 	uint32_t push_data_cursor  = 0;
 	m_program_cache->Resolve(renderer, params, input_info, push_data_cursor, results, program);
+	// KYTY_PERF_ADOPT_PLAN: the operation's reads are complete.
+	if (AdoptPlanPossible()) results.log.BuildPlan();
 	ReportResolveStats(results.count);
 }
 
@@ -2357,6 +2373,8 @@ void PipelineCache::ResolveGraphicsPrograms(RenderContext& renderer, const HW::V
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		m_program_cache->Resolve(renderer, vertex_params[i], vertex_info[i], push_data_cursor, results, programs.vertex[i]);
 	}
+	// KYTY_PERF_ADOPT_PLAN: the operation's reads are complete.
+	if (AdoptPlanPossible()) results.log.BuildPlan();
 	ReportResolveStats(results.count);
 }
 

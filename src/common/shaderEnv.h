@@ -80,6 +80,9 @@ inline constexpr const char* OutputOnlyNames[] = {
     "KYTY_DIAG_SKIP_CS_HASHES",
     "KYTY_DIAG_SKIP_CS_LIVE",
     "KYTY_DIAG_SKIP_UNSUPPORTED_CS",
+    // Whether the resolve helpers also keep a log's reads as merged spans (pipelineCache.cpp): the
+    // same reads and bytes.
+    "KYTY_PERF_ADOPT_PLAN",
     // The background compiles' reuse store (shaderPrecompile.cpp): the same SPIR-V, made earlier.
     "KYTY_PERF_SHADER_REUSE_MB",
     // Table-mode pipelines made in the background: the key a lookup asks for, not what a key makes.

@@ -5,6 +5,7 @@
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
 #include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -1677,7 +1678,7 @@ static Graphics::ShaderRecompiler::IR::AheadReadStatus AheadReadBacking(uint64_t
 //    pages are among the run's pages.
 //  * Entries are verified in log order; an entry the verifier cannot prove goes to the readers (which may download
 //    GPU-dirty bytes and clear page bits, never set them), so nothing proven earlier can become stale.
-static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
+static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReadsByEntry(
     const Graphics::ShaderRecompiler::IR::ReadLog& log, size_t begin, size_t& stop,
     Graphics::ShaderRecompiler::IR::FastAdoptStats& stats) {
 	namespace Ir = Graphics::ShaderRecompiler::IR;
@@ -1856,6 +1857,157 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 	}
 	stop = count;
 	return Result::Unchanged;
+}
+
+// KYTY_PERF_ADOPT_PLAN=1 (default 0; 2 = verify; toggles in KYTY_LIVE_AB): the check of a whole log
+// through the spans its helper merged (ReadLog::BuildPlan) instead of through its entries. The
+// entry path walks the log in read order and compares a run at a time; a resolve reads many small
+// pieces of a few pages (the village, 19.11: ~20 entries of ~14 bytes per operation, ~8,300
+// operations per frame, 5.5 ms of the execution thread per frame; the cost is the number of pieces,
+// the bytes are 2.5 MB). The plan holds the same bytes, each once, as spans sorted by address (~8.5
+// per operation). The plan path asks every page of every span the questions the entry path asks (a
+// GPU address, no pending readback, not GPU-modified; the answers shared through the session's page
+// cache) and then compares every span with the bytes the entry path would compare with: an ordinary
+// span with the guest address, a strict one with the backing store under the address-space lock
+// (CompareBackingBatch). It answers only "unchanged", and only when all of that holds: then every
+// entry reads as logged, which is what the entry path's "unchanged" says. In every other case - no
+// plan, a page that is not clean, a span under the image read watch, a strict span that is not one
+// plain mapping, a difference - it answers nothing and the entry path decides as before (including
+// which entry changed). =2: after a plan's "unchanged" the entry path checks the same log and must
+// say "unchanged" too; a difference is counted and logged (ADOPT_PLAN_DIFFERENCE). KYTY_TRACE_PERF:
+// PERF adopt_plan every ~5 s (checks the plan answered, spans and entries per check, checks left to
+// the entry path; with =2 the totals of the comparison).
+namespace {
+struct AdoptPlanStats {
+	uint64_t answered = 0, spans = 0, entries = 0, no_plan = 0, declined = 0;
+	uint64_t verify_checks = 0, verify_differences = 0; // =2, since the start
+	std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+AdoptPlanStats g_adopt_plan; // GPU thread
+
+uint32_t AdoptPlanMode() {
+	static const uint32_t fixed = [] {
+		const char* value = std::getenv("KYTY_PERF_ADOPT_PLAN");
+		return value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
+		           ? static_cast<uint32_t>(value[0] - '0')
+		           : 0u;
+	}();
+	return Common::LiveAb::Gate(Common::LiveAb::Switch::AdoptPlan, fixed);
+}
+
+// True: every span of the log's plan reads as the plan holds it.
+bool VerifyReadPlan(const Graphics::ShaderRecompiler::IR::ReadLog& log) {
+	namespace Ir                                         = Graphics::ShaderRecompiler::IR;
+	auto&     cache                                      = t_ordinary_read_pages;
+	uint64_t  local_pages[OrdinaryReadPageCache::kSlots] = {~0ull, ~0ull, ~0ull, ~0ull,
+	                                                        ~0ull, ~0ull, ~0ull, ~0ull};
+	uint64_t* pages                                      = cache.active ? cache.pages : local_pages;
+	auto&     buffers                                    = GetGpuResources().GetBufferCache();
+	uint64_t  last_page                                  = ~0ull;
+	for (const auto& span: log.plan) {
+		if (!IsGpuAddressRange(span.address, span.size)) return false;
+		const uint64_t last = (span.address + span.size - 1u) >> 12u;
+		for (uint64_t page = span.address >> 12u; page <= last; ++page) {
+			if (page == last_page) continue;
+			auto& slot = pages[page % OrdinaryReadPageCache::kSlots];
+			if (slot != page) {
+				const uint64_t base = page << 12u;
+				if (!IsGpuAddressRange(base, 4096u)) return false;
+				if (buffers.WaitPendingReadbacks(base, 4096u) ||
+				    buffers.IsRegionGpuModified(base, 4096u))
+					return false;
+				slot = page;
+			}
+			last_page = page;
+		}
+	}
+	constexpr size_t                      kMaxPending = 32;
+	GuestAddressSpace::BackingCompareSpan strict[kMaxPending];
+	size_t                                pending = 0;
+	const auto                            flush   = [&] {
+        if (pending == 0) return true;
+        size_t     bad = 0;
+        const auto outcome = g_guest_address_space->CompareBackingBatch(strict, pending, &bad);
+        pending = 0;
+        return outcome == GuestAddressSpace::BackingCompareResult::Equal;
+	};
+	for (const auto& span: log.plan) {
+		const uint8_t* const expected = log.plan_bytes.data() + span.first;
+		if (span.kind == Ir::ReadLog::Kind::Ordinary) {
+			// The entry path reads a watched range through ReadGuestPlain; left to it.
+			if (GuestImageReadArmed(span.address, span.size)) return false;
+			if (std::memcmp(reinterpret_cast<const void*>(span.address), expected, span.size) != 0)
+				return false;
+		} else {
+			strict[pending] = {span.address, expected, span.size};
+			if (++pending == kMaxPending && !flush()) return false;
+		}
+	}
+	return flush();
+}
+} // namespace
+
+static Graphics::ShaderRecompiler::IR::FastVerifyResult
+FastVerifyLoggedReads(const Graphics::ShaderRecompiler::IR::ReadLog& log, size_t begin,
+                      size_t& stop, Graphics::ShaderRecompiler::IR::FastAdoptStats& stats) {
+	namespace Ir        = Graphics::ShaderRecompiler::IR;
+	using Result        = Ir::FastVerifyResult;
+	const uint32_t mode = begin == 0 && !log.entries.empty() ? AdoptPlanMode() : 0u;
+	if (mode == 0u || g_gpu_resources == nullptr || g_guest_address_space == nullptr ||
+	    !Graphics::GuestGpu::IsGpuThread() || Ir::SrtClassTrace()) {
+		return FastVerifyLoggedReadsByEntry(log, begin, stop, stats);
+	}
+	auto& p      = g_adopt_plan;
+	bool  proven = false;
+	if (!log.PlanUsable()) {
+		p.no_plan++;
+	} else if (VerifyReadPlan(log)) {
+		proven = true;
+		p.answered++;
+		p.spans += log.plan.size();
+		p.entries += log.entries.size();
+	} else {
+		p.declined++;
+	}
+	if (proven && mode == 2u) {
+		size_t             check_stop = 0;
+		Ir::FastAdoptStats check_stats;
+		const auto         check = FastVerifyLoggedReadsByEntry(log, 0, check_stop, check_stats);
+		p.verify_checks++;
+		if (check != Result::Unchanged && p.verify_differences++ < 32u) {
+			std::fprintf(
+			    stderr, "ADOPT_PLAN_DIFFERENCE entries=%zu spans=%zu entry=%zu result=%u\n",
+			    log.entries.size(), log.plan.size(), check_stop, static_cast<uint32_t>(check));
+		}
+	}
+	if (const auto now = std::chrono::steady_clock::now();
+	    now - p.window >= std::chrono::seconds(5)) {
+		if (Common::EnvRead::PerfLines()) {
+			std::fprintf(
+			    stderr,
+			    "PERF adopt_plan answered=%llu (spans/check %.2f, entries/check %.2f) "
+			    "entry_path[no_plan=%llu declined=%llu] "
+			    "(per ~5 s) verify[checks=%llu differences=%llu] (total)\n",
+			    static_cast<unsigned long long>(p.answered),
+			    p.answered != 0 ? static_cast<double>(p.spans) / static_cast<double>(p.answered)
+			                    : 0.0,
+			    p.answered != 0 ? static_cast<double>(p.entries) / static_cast<double>(p.answered)
+			                    : 0.0,
+			    static_cast<unsigned long long>(p.no_plan),
+			    static_cast<unsigned long long>(p.declined),
+			    static_cast<unsigned long long>(p.verify_checks),
+			    static_cast<unsigned long long>(p.verify_differences));
+		}
+		p.answered = p.spans = p.entries = p.no_plan = p.declined = 0;
+		p.window                                                  = now;
+	}
+	if (proven && mode == 1u) {
+		stats.entries_fast += log.entries.size();
+		stats.runs += log.plan.size();
+		stop = log.entries.size();
+		return Result::Unchanged;
+	}
+	return FastVerifyLoggedReadsByEntry(log, begin, stop, stats);
 }
 
 uint64_t TryClampReservedRangeSize(uint64_t vaddr, uint64_t size) {

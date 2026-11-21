@@ -36,6 +36,7 @@ enum class Switch : uint32_t {
 	DiagCeilingSrtNoWait,      // KYTY_DIAG_CEILING_SRT_NO_WAIT (measurement only, APPROXIMATION)
 	DiagTablesAssume,          // KYTY_DIAG_TABLES_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
 	DiagAdoptAssume,           // KYTY_DIAG_ADOPT_ASSUME_UNCHANGED (measurement only, APPROXIMATION)
+	AdoptPlan,                 // KYTY_PERF_ADOPT_PLAN
 	Count
 };
 
